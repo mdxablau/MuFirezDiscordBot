@@ -1,6 +1,5 @@
 import os
 import json
-import asyncio
 import requests
 import discord
 from discord.ext import commands, tasks
@@ -15,7 +14,9 @@ SETTINGS_FILE = "bot_settings.json"
 # In-memory cache + duplicate protection
 cached_events = []
 sent_reminders = set()
-sent_countdowns = set()
+
+# Reminder schedule (minutes before event)
+REMINDER_MINUTES = [5, 3, 1]
 
 # =========================
 # LOAD SETTINGS
@@ -23,7 +24,6 @@ sent_countdowns = set()
 def load_settings():
     default_settings = {
         "timezone": "UTC",
-        "notify_minutes_before": 5,
         "discord_channel_id": 1493841667231449210,
         "farmers_role_id": 1493850248488161321,
         "enabled_categories": {
@@ -101,7 +101,8 @@ def parse_event_time(event):
         "datetime",
         "time",
         "nextSpawn",
-        "next_spawn"
+        "next_spawn",
+        "nextOccurrence"
     ]
 
     for key in possible_keys:
@@ -211,24 +212,6 @@ async def invasion(ctx):
     await ctx.send("\n".join(lines))
 
 # =========================
-# COUNTDOWN MESSAGE
-# =========================
-async def run_countdown(channel, event_name):
-    try:
-        msg = await channel.send(f"⏳ **{event_name}** starts in **5 seconds...**")
-
-        for i in range(4, 0, -1):
-            await asyncio.sleep(1)
-            await msg.edit(content=f"⏳ **{event_name}** starts in **{i}...**")
-
-        await asyncio.sleep(1)
-        await msg.edit(content=f"🚀 **{event_name}** is LIVE!")
-        print(f"Countdown finished: {event_name}")
-
-    except Exception as e:
-        print(f"Countdown error for {event_name}: {e}")
-
-# =========================
 # FETCH LOOP (LOW API SPAM)
 # =========================
 @tasks.loop(seconds=30)
@@ -253,7 +236,6 @@ async def before_refresh_event_cache():
 async def auto_reminder_loop():
     channel_id = settings.get("discord_channel_id", 0)
     farmers_role_id = settings.get("farmers_role_id", 0)
-    notify_minutes = settings.get("notify_minutes_before", 5)
     enabled_categories = settings.get("enabled_categories", {})
 
     if not channel_id:
@@ -283,81 +265,58 @@ async def auto_reminder_loop():
 
         diff_seconds = (dt - now).total_seconds()
 
-        # =========================
-        # 5 MIN REMINDER WITH PING
-        # =========================
-        target_reminder_seconds = notify_minutes * 60
+        # Skip already passed events
+        if diff_seconds <= 0:
+            continue
 
-        if target_reminder_seconds - 1 < diff_seconds <= target_reminder_seconds:
-            reminder_key = f"{category}|{name}|{dt.isoformat()}|{notify_minutes}"
+        # Check each reminder time (5, 3, 1 minutes)
+        for minutes_before in REMINDER_MINUTES:
+            target_seconds = minutes_before * 60
 
-            if reminder_key not in sent_reminders:
-                sent_reminders.add(reminder_key)
+            # 30-second safe window to avoid missing reminder due to cache timing
+            if target_seconds - 30 < diff_seconds <= target_seconds:
+                reminder_key = f"{category}|{name}|{dt.isoformat()}|{minutes_before}"
 
-                role_mention = f"<@&{farmers_role_id}>" if farmers_role_id else "@Farmers"
+                if reminder_key not in sent_reminders:
+                    sent_reminders.add(reminder_key)
 
-                message = (
-                    f"{role_mention}\n"
-                    f"⏰ **Mu Firez Reminder**\n"
-                    f"**{name}** ({category}) starts in **{notify_minutes} minutes!**\n"
-                    f"🕒 Spawn Time: **{dt.strftime('%Y-%m-%d %H:%M:%S UTC')}**"
-                )
+                    role_mention = f"<@&{farmers_role_id}>" if farmers_role_id else "@Farmers"
 
-                try:
-                    await channel.send(message)
-                    print(f"Reminder sent: {name} ({category})")
-                except Exception as e:
-                    print(f"Failed to send reminder: {e}")
+                    message = (
+                        f"{role_mention}\n"
+                        f"⏰ **Mu Firez Reminder**\n"
+                        f"**{name}** ({category}) starts in **{minutes_before} minute{'s' if minutes_before != 1 else ''}!**\n"
+                        f"🕒 Spawn Time: **{dt.strftime('%Y-%m-%d %H:%M:%S UTC')}**"
+                    )
 
-        # =========================
-        # 5 SECOND COUNTDOWN (NO PING)
-        # =========================
-        if 4 < diff_seconds <= 5:
-            countdown_key = f"{category}|{name}|{dt.isoformat()}|countdown"
+                    try:
+                        await channel.send(message)
+                        print(f"Reminder sent: {name} ({category}) - {minutes_before} min")
+                    except Exception as e:
+                        print(f"Failed to send reminder: {e}")
 
-            if countdown_key not in sent_countdowns:
-                sent_countdowns.add(countdown_key)
-                asyncio.create_task(run_countdown(channel, name))
-                print(f"Countdown started: {name} ({category})")
+    cleanup_old_reminders()
 
-    cleanup_old_keys()
-
-def cleanup_old_keys():
+def cleanup_old_reminders():
     now = datetime.now(timezone.utc)
 
-    # cleanup reminders
-    reminder_remove = []
+    to_remove = []
     for key in sent_reminders:
         try:
             parts = key.split("|")
             dt = datetime.fromisoformat(parts[2])
+
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
 
+            # Remove old reminder records 2 hours after event
             if now - dt > timedelta(hours=2):
-                reminder_remove.append(key)
+                to_remove.append(key)
         except:
-            reminder_remove.append(key)
+            to_remove.append(key)
 
-    for key in reminder_remove:
+    for key in to_remove:
         sent_reminders.discard(key)
-
-    # cleanup countdowns
-    countdown_remove = []
-    for key in sent_countdowns:
-        try:
-            parts = key.split("|")
-            dt = datetime.fromisoformat(parts[2])
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-
-            if now - dt > timedelta(hours=2):
-                countdown_remove.append(key)
-        except:
-            countdown_remove.append(key)
-
-    for key in countdown_remove:
-        sent_countdowns.discard(key)
 
 # =========================
 # BOT READY
