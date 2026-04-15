@@ -1,0 +1,1 @@
+worker: python mufirez_bot.py
