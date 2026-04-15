@@ -12,8 +12,10 @@ from datetime import datetime, timedelta, timezone
 API_URL = "https://api.mufirez.net/api/events"
 SETTINGS_FILE = "bot_settings.json"
 
-# Keeps track of reminders already sent (prevents duplicates)
+# In-memory cache + duplicate protection
+cached_events = []
 sent_reminders = set()
+sent_countdowns = set()
 
 # =========================
 # LOAD SETTINGS
@@ -46,7 +48,6 @@ settings = load_settings()
 # =========================
 intents = discord.Intents.default()
 intents.message_content = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
@@ -58,10 +59,6 @@ def fetch_mufirez_events():
         response.raise_for_status()
 
         outer = response.json()
-
-        # Handles both formats:
-        # 1) {"data": [...]} 
-        # 2) {"data": {"events": [...], "boss": [...], "invasion": [...]}}
         data = outer.get("data", [])
 
         if isinstance(data, dict):
@@ -97,7 +94,6 @@ def fetch_mufirez_events():
 # DATETIME PARSER
 # =========================
 def parse_event_time(event):
-    # Try common possible keys from API
     possible_keys = [
         "startAt",
         "start_at",
@@ -112,7 +108,6 @@ def parse_event_time(event):
         if key in event and event[key]:
             raw = str(event[key]).strip()
 
-            # Normalize Zulu time
             if raw.endswith("Z"):
                 raw = raw.replace("Z", "+00:00")
 
@@ -124,7 +119,7 @@ def parse_event_time(event):
     return None
 
 # =========================
-# EVENT NAME / CATEGORY
+# EVENT HELPERS
 # =========================
 def get_event_name(event):
     return (
@@ -139,30 +134,15 @@ def get_event_name(event):
 def get_event_category(event):
     category = event.get("category", "Unknown")
 
-    # fallback if API includes type/category field
     if category == "Unknown":
         category = event.get("type") or event.get("category") or "Unknown"
 
     return str(category)
 
-# =========================
-# FORMATTERS
-# =========================
-def format_timer_line(event):
-    name = get_event_name(event)
-    category = get_event_category(event)
-    dt = parse_event_time(event)
-
-    if not dt:
-        return f"- {name} ({category}) -> Unknown time"
-
-    return f"- {name} ({category}) -> {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}"
-
 def get_next_by_category(category_name, limit=10):
-    data = fetch_mufirez_events()
     filtered = []
 
-    for event in data:
+    for event in cached_events:
         category = get_event_category(event).lower()
         if category == category_name.lower():
             dt = parse_event_time(event)
@@ -193,7 +173,7 @@ async def events(ctx):
         name = get_event_name(event)
         lines.append(f"• {name} ➜ {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
-    lines.append("\nTimes shown are from Mu Firez API (UTC)")
+    lines.append("\nTimes shown are from Mu Firez API cache (UTC)")
     await ctx.send("\n".join(lines))
 
 @bot.command()
@@ -210,7 +190,7 @@ async def boss(ctx):
         name = get_event_name(event)
         lines.append(f"• {name} ➜ {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
-    lines.append("\nTimes shown are from Mu Firez API (UTC)")
+    lines.append("\nTimes shown are from Mu Firez API cache (UTC)")
     await ctx.send("\n".join(lines))
 
 @bot.command()
@@ -227,13 +207,49 @@ async def invasion(ctx):
         name = get_event_name(event)
         lines.append(f"• {name} ➜ {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
-    lines.append("\nTimes shown are from Mu Firez API (UTC)")
+    lines.append("\nTimes shown are from Mu Firez API cache (UTC)")
     await ctx.send("\n".join(lines))
 
 # =========================
-# AUTO REMINDER LOOP
+# COUNTDOWN MESSAGE
 # =========================
-@tasks.loop(minutes=1)
+async def run_countdown(channel, event_name):
+    try:
+        msg = await channel.send(f"⏳ **{event_name}** starts in **5 seconds...**")
+
+        for i in range(4, 0, -1):
+            await asyncio.sleep(1)
+            await msg.edit(content=f"⏳ **{event_name}** starts in **{i}...**")
+
+        await asyncio.sleep(1)
+        await msg.edit(content=f"🚀 **{event_name}** is LIVE!")
+        print(f"Countdown finished: {event_name}")
+
+    except Exception as e:
+        print(f"Countdown error for {event_name}: {e}")
+
+# =========================
+# FETCH LOOP (LOW API SPAM)
+# =========================
+@tasks.loop(seconds=30)
+async def refresh_event_cache():
+    global cached_events
+
+    data = fetch_mufirez_events()
+    if data:
+        cached_events = data
+        print(f"Cache refreshed: {len(cached_events)} events loaded")
+    else:
+        print("Cache refresh returned no data (keeping old cache if available)")
+
+@refresh_event_cache.before_loop
+async def before_refresh_event_cache():
+    await bot.wait_until_ready()
+
+# =========================
+# REMINDER LOOP (USES CACHE)
+# =========================
+@tasks.loop(seconds=1)
 async def auto_reminder_loop():
     channel_id = settings.get("discord_channel_id", 0)
     farmers_role_id = settings.get("farmers_role_id", 0)
@@ -249,10 +265,9 @@ async def auto_reminder_loop():
         print("Could not find channel. Check discord_channel_id.")
         return
 
-    data = fetch_mufirez_events()
     now = datetime.now(timezone.utc)
 
-    for event in data:
+    for event in cached_events:
         name = get_event_name(event)
         category = get_event_category(event)
         dt = parse_event_time(event)
@@ -260,51 +275,58 @@ async def auto_reminder_loop():
         if not dt:
             continue
 
-        # Skip disabled categories
         if not enabled_categories.get(category, False):
             continue
 
-        # Ensure timezone aware
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
 
         diff_seconds = (dt - now).total_seconds()
-        diff_minutes = diff_seconds / 60
 
-        # Trigger only if event is within the reminder window
-        # (example: between 4.0 and 5.0 minutes before if notify_minutes = 5)
-        if notify_minutes - 1 < diff_minutes <= notify_minutes:
+        # =========================
+        # 5 MIN REMINDER WITH PING
+        # =========================
+        target_reminder_seconds = notify_minutes * 60
+
+        if target_reminder_seconds - 1 < diff_seconds <= target_reminder_seconds:
             reminder_key = f"{category}|{name}|{dt.isoformat()}|{notify_minutes}"
 
-            if reminder_key in sent_reminders:
-                continue
+            if reminder_key not in sent_reminders:
+                sent_reminders.add(reminder_key)
 
-            sent_reminders.add(reminder_key)
+                role_mention = f"<@&{farmers_role_id}>" if farmers_role_id else "@Farmers"
 
-            role_mention = f"<@&{farmers_role_id}>" if farmers_role_id else "@farmers"
+                message = (
+                    f"{role_mention}\n"
+                    f"⏰ **Mu Firez Reminder**\n"
+                    f"**{name}** ({category}) starts in **{notify_minutes} minutes!**\n"
+                    f"🕒 Spawn Time: **{dt.strftime('%Y-%m-%d %H:%M:%S UTC')}**"
+                )
 
-            message = (
-                f"{role_mention}\n"
-                f"⏰ **Mu Firez Reminder**\n"
-                f"**{name}** ({category}) starts in **{notify_minutes} minutes!**\n"
-                f"🕒 Spawn Time: **{dt.strftime('%Y-%m-%d %H:%M:%S UTC')}**"
-            )
+                try:
+                    await channel.send(message)
+                    print(f"Reminder sent: {name} ({category})")
+                except Exception as e:
+                    print(f"Failed to send reminder: {e}")
 
-            try:
-                await channel.send(message)
-                print(f"Reminder sent: {name} ({category})")
-            except Exception as e:
-                print(f"Failed to send reminder: {e}")
+        # =========================
+        # 5 SECOND COUNTDOWN (NO PING)
+        # =========================
+        if 4 < diff_seconds <= 5:
+            countdown_key = f"{category}|{name}|{dt.isoformat()}|countdown"
 
-    # Clean old reminder keys occasionally
-    cleanup_old_reminders()
+            if countdown_key not in sent_countdowns:
+                sent_countdowns.add(countdown_key)
+                asyncio.create_task(run_countdown(channel, name))
+                print(f"Countdown started: {name} ({category})")
 
-def cleanup_old_reminders():
-    # Removes reminders for events that already passed a while ago
-    # Keeps memory from growing too much during long uptime
-    to_remove = []
+    cleanup_old_keys()
+
+def cleanup_old_keys():
     now = datetime.now(timezone.utc)
 
+    # cleanup reminders
+    reminder_remove = []
     for key in sent_reminders:
         try:
             parts = key.split("|")
@@ -312,19 +334,30 @@ def cleanup_old_reminders():
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
 
-            # Remove if older than 2 hours
             if now - dt > timedelta(hours=2):
-                to_remove.append(key)
+                reminder_remove.append(key)
         except:
-            to_remove.append(key)
+            reminder_remove.append(key)
 
-    for key in to_remove:
+    for key in reminder_remove:
         sent_reminders.discard(key)
 
-@auto_reminder_loop.before_loop
-async def before_auto_reminder_loop():
-    await bot.wait_until_ready()
-    print("Auto reminder loop started.")
+    # cleanup countdowns
+    countdown_remove = []
+    for key in sent_countdowns:
+        try:
+            parts = key.split("|")
+            dt = datetime.fromisoformat(parts[2])
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+
+            if now - dt > timedelta(hours=2):
+                countdown_remove.append(key)
+        except:
+            countdown_remove.append(key)
+
+    for key in countdown_remove:
+        sent_countdowns.discard(key)
 
 # =========================
 # BOT READY
@@ -334,8 +367,22 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
     print("Mu Firez Timer Bot is online!")
 
+    if not refresh_event_cache.is_running():
+        refresh_event_cache.start()
+
     if not auto_reminder_loop.is_running():
         auto_reminder_loop.start()
+
+    # Prime cache immediately on startup
+    global cached_events
+    initial_data = fetch_mufirez_events()
+    if initial_data:
+        cached_events = initial_data
+        print(f"Initial cache loaded: {len(cached_events)} events")
+    else:
+        print("Initial cache load failed")
+
+    print("Auto reminder loop started.")
 
 # =========================
 # START BOT
