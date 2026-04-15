@@ -1,278 +1,179 @@
 import os
+import json
+import asyncio
+import requests
 import discord
 from discord.ext import commands, tasks
-import requests
-import json
-import urllib3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # =========================
 # CONFIG
 # =========================
-TOKEN = os.getenv("DISCORD_TOKEN")
-PREFIX = "!"
 API_URL = "https://api.mufirez.net/api/events"
 SETTINGS_FILE = "bot_settings.json"
 
-# How many results to show per command
-EVENT_LIMIT = 10
-BOSS_LIMIT = 10
-INVASION_LIMIT = 10
-
-# Alert window (minutes before spawn)
-ALERT_MINUTES_BEFORE = 5
-
-# Hide SSL warning because Mu Firez API certificate is not set up properly
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Keeps track of reminders already sent (prevents duplicates)
+sent_reminders = set()
 
 # =========================
-# DISCORD BOT SETUP
+# LOAD SETTINGS
+# =========================
+def load_settings():
+    default_settings = {
+        "timezone": "UTC",
+        "notify_minutes_before": 5,
+        "discord_channel_id": 1493841667231449210,
+        "farmers_role_id": 1493850248488161321,
+        "enabled_categories": {
+            "Events": True,
+            "Boss": True,
+            "Invasion": True
+        }
+    }
+
+    if not os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(default_settings, f, indent=4)
+        return default_settings
+
+    with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+settings = load_settings()
+
+# =========================
+# DISCORD SETUP
 # =========================
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
-# SETTINGS STORAGE
-# =========================
-settings = {
-    "alerts_enabled": False,
-    "alert_channel_id": None,
-    "sent_alerts": []
-}
-
-def load_settings():
-    global settings
-    try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            settings = json.load(f)
-    except:
-        save_settings()
-
-def save_settings():
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings, f, indent=4)
-
-# =========================
-# API FUNCTIONS
+# API FETCH
 # =========================
 def fetch_mufirez_events():
-    headers = {
-        "Origin": "https://launcher.mufirez.net",
-        "Referer": "https://launcher.mufirez.net/",
-        "User-Agent": "mufirez/1.0.29"
-    }
-
-    response = requests.get(API_URL, headers=headers, timeout=15, verify=False)
-    response.raise_for_status()
-
-    outer = response.json()
-
-    if not outer.get("success"):
-        return None
-
-    data_field = outer["data"]
-
-    if isinstance(data_field, str):
-        inner = json.loads(data_field)
-    else:
-        inner = data_field
-
-    return inner
-
-def parse_next_occurrence(date_string):
     try:
-        return datetime.fromisoformat(date_string.replace("Z", "+00:00"))
-    except:
-        return None
+        response = requests.get(API_URL, timeout=15)
+        response.raise_for_status()
 
-def format_countdown(target_dt):
-    if not target_dt:
-        return "unknown"
+        outer = response.json()
 
-    now = datetime.now(timezone.utc)
-    diff = target_dt - now
-    total_seconds = int(diff.total_seconds())
+        # Handles both formats:
+        # 1) {"data": [...]} 
+        # 2) {"data": {"events": [...], "boss": [...], "invasion": [...]}}
+        data = outer.get("data", [])
 
-    if total_seconds <= 0:
-        return "now"
+        if isinstance(data, dict):
+            combined = []
 
-    days = total_seconds // 86400
-    hours = (total_seconds % 86400) // 3600
-    minutes = (total_seconds % 3600) // 60
+            if "events" in data and isinstance(data["events"], list):
+                for item in data["events"]:
+                    item["category"] = "Events"
+                    combined.append(item)
 
-    parts = []
+            if "boss" in data and isinstance(data["boss"], list):
+                for item in data["boss"]:
+                    item["category"] = "Boss"
+                    combined.append(item)
 
-    if days > 0:
-        parts.append(f"{days}d")
-    if hours > 0:
-        parts.append(f"{hours}h")
-    if minutes > 0:
-        parts.append(f"{minutes}m")
+            if "invasion" in data and isinstance(data["invasion"], list):
+                for item in data["invasion"]:
+                    item["category"] = "Invasion"
+                    combined.append(item)
 
-    if not parts:
-        parts.append("less than 1m")
+            return combined
 
-    return "in " + " ".join(parts)
+        elif isinstance(data, list):
+            return data
 
-def format_utc_time(target_dt):
-    if not target_dt:
-        return "unknown"
-    return target_dt.strftime("%Y-%m-%d %H:%M UTC")
-
-def get_items_by_category(category_name, limit=10):
-    data = fetch_mufirez_events()
-    if not data:
         return []
 
-    events = data.get("events", [])
+    except Exception as e:
+        print(f"Error fetching Mu Firez API: {e}")
+        return []
 
-    filtered = [
-        e for e in events
-        if e.get("category", "").lower() == category_name.lower()
+# =========================
+# DATETIME PARSER
+# =========================
+def parse_event_time(event):
+    # Try common possible keys from API
+    possible_keys = [
+        "startAt",
+        "start_at",
+        "date",
+        "datetime",
+        "time",
+        "nextSpawn",
+        "next_spawn"
     ]
 
-    filtered.sort(
-        key=lambda x: parse_next_occurrence(x["nextOccurrence"]) or datetime.max.replace(tzinfo=timezone.utc)
-    )
+    for key in possible_keys:
+        if key in event and event[key]:
+            raw = str(event[key]).strip()
 
-    return filtered[:limit]
+            # Normalize Zulu time
+            if raw.endswith("Z"):
+                raw = raw.replace("Z", "+00:00")
 
-def get_all_items():
-    data = fetch_mufirez_events()
-    if not data:
-        return []
+            try:
+                return datetime.fromisoformat(raw)
+            except:
+                pass
 
-    items = data.get("events", [])
-
-    items.sort(
-        key=lambda x: parse_next_occurrence(x["nextOccurrence"]) or datetime.max.replace(tzinfo=timezone.utc)
-    )
-
-    return items
-
-def build_embed(title, items, footer_text):
-    if not items:
-        return None
-
-    lines = []
-
-    for e in items:
-        dt = parse_next_occurrence(e["nextOccurrence"])
-        utc_text = format_utc_time(dt)
-        countdown_text = format_countdown(dt)
-
-        lines.append(
-            f"• **{e['name']}**\n"
-            f"  ⏰ `{utc_text}`\n"
-            f"  🕒 `{countdown_text}`"
-        )
-
-    embed = discord.Embed(
-        title=title,
-        description="\n\n".join(lines),
-        color=discord.Color.red()
-    )
-    embed.set_footer(text=footer_text)
-    return embed
+    return None
 
 # =========================
-# ALERT HELPERS
+# EVENT NAME / CATEGORY
 # =========================
-def cleanup_old_alerts():
-    if len(settings["sent_alerts"]) > 300:
-        settings["sent_alerts"] = settings["sent_alerts"][-300:]
-        save_settings()
-
-def should_alert(item):
-    dt = parse_next_occurrence(item["nextOccurrence"])
-    if not dt:
-        return False, None
-
-    now = datetime.now(timezone.utc)
-    diff_minutes = (dt - now).total_seconds() / 60
-
-    if 4.0 <= diff_minutes <= 5.9:
-        unique_key = f"{item['category']}|{item['name']}|{item['nextOccurrence']}"
-        if unique_key not in settings["sent_alerts"]:
-            return True, unique_key
-
-    return False, None
-
-def build_alert_message(item):
-    dt = parse_next_occurrence(item["nextOccurrence"])
-    utc_text = format_utc_time(dt)
-
-    category = item.get("category", "Unknown")
-    name = item.get("name", "Unknown")
-
-    if category.lower() == "boss":
-        icon = "👑"
-        action = "spawns"
-    elif category.lower() == "invasion":
-        icon = "⚔️"
-        action = "starts"
-    else:
-        icon = "🔥"
-        action = "starts"
-
+def get_event_name(event):
     return (
-        f"{icon} **{name}** ({category}) {action} in **{ALERT_MINUTES_BEFORE} minutes!**\n"
-        f"⏰ `{utc_text}`"
+        event.get("name")
+        or event.get("title")
+        or event.get("event")
+        or event.get("boss")
+        or event.get("monster")
+        or "Unknown"
     )
 
-# =========================
-# BACKGROUND TASK
-# =========================
-@tasks.loop(minutes=1)
-async def auto_alert_loop():
-    if not settings.get("alerts_enabled"):
-        return
+def get_event_category(event):
+    category = event.get("category", "Unknown")
 
-    channel_id = settings.get("alert_channel_id")
-    if not channel_id:
-        return
+    # fallback if API includes type/category field
+    if category == "Unknown":
+        category = event.get("type") or event.get("category") or "Unknown"
 
-    channel = bot.get_channel(channel_id)
-    if channel is None:
-        return
-
-    try:
-        items = get_all_items()
-        if not items:
-            return
-
-        cleanup_old_alerts()
-
-        for item in items:
-            alert, unique_key = should_alert(item)
-
-            if alert:
-                message = build_alert_message(item)
-                await channel.send(message)
-
-                settings["sent_alerts"].append(unique_key)
-                save_settings()
-
-    except Exception as ex:
-        print(f"[AUTO ALERT ERROR] {ex}")
+    return str(category)
 
 # =========================
-# BOT EVENTS
+# FORMATTERS
 # =========================
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}")
-    print("Mu Firez Timer Bot is online!")
+def format_timer_line(event):
+    name = get_event_name(event)
+    category = get_event_category(event)
+    dt = parse_event_time(event)
 
-    load_settings()
+    if not dt:
+        return f"- {name} ({category}) -> Unknown time"
 
-    if not auto_alert_loop.is_running():
-        auto_alert_loop.start()
+    return f"- {name} ({category}) -> {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+
+def get_next_by_category(category_name, limit=10):
+    data = fetch_mufirez_events()
+    filtered = []
+
+    for event in data:
+        category = get_event_category(event).lower()
+        if category == category_name.lower():
+            dt = parse_event_time(event)
+            if dt:
+                filtered.append((dt, event))
+
+    filtered.sort(key=lambda x: x[0])
+    return [event for _, event in filtered[:limit]]
 
 # =========================
-# BOT COMMANDS
+# COMMANDS
 # =========================
 @bot.command()
 async def ping(ctx):
@@ -280,165 +181,167 @@ async def ping(ctx):
 
 @bot.command()
 async def events(ctx):
-    try:
-        event_list = get_items_by_category("Events", limit=EVENT_LIMIT)
+    items = get_next_by_category("Events", 10)
 
-        if not event_list:
-            await ctx.send("❌ Could not fetch Mu Firez event timers.")
-            return
+    if not items:
+        await ctx.send("No upcoming Events found.")
+        return
 
-        embed = build_embed(
-            "🔥 Mu Firez - Next Event Timers",
-            event_list,
-            "Times shown in UTC + live countdown from Mu Firez API"
-        )
+    lines = ["🔥 **Mu Firez - Next Event Timers**\n"]
+    for event in items:
+        dt = parse_event_time(event)
+        name = get_event_name(event)
+        lines.append(f"• {name} ➜ {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
-        await ctx.send(embed=embed)
-
-    except Exception as ex:
-        await ctx.send(f"❌ Error fetching events: `{ex}`")
+    lines.append("\nTimes shown are from Mu Firez API (UTC)")
+    await ctx.send("\n".join(lines))
 
 @bot.command()
 async def boss(ctx):
-    try:
-        boss_list = get_items_by_category("Boss", limit=BOSS_LIMIT)
+    items = get_next_by_category("Boss", 10)
 
-        if not boss_list:
-            await ctx.send("❌ Could not fetch Mu Firez boss timers.")
-            return
+    if not items:
+        await ctx.send("No upcoming Boss timers found.")
+        return
 
-        embed = build_embed(
-            "👑 Mu Firez - Next Boss Timers",
-            boss_list,
-            "Times shown in UTC + live countdown from Mu Firez API"
-        )
+    lines = ["👑 **Mu Firez - Next Boss Timers**\n"]
+    for event in items:
+        dt = parse_event_time(event)
+        name = get_event_name(event)
+        lines.append(f"• {name} ➜ {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
-        await ctx.send(embed=embed)
-
-    except Exception as ex:
-        await ctx.send(f"❌ Error fetching boss timers: `{ex}`")
+    lines.append("\nTimes shown are from Mu Firez API (UTC)")
+    await ctx.send("\n".join(lines))
 
 @bot.command()
 async def invasion(ctx):
-    try:
-        invasion_list = get_items_by_category("Invasion", limit=INVASION_LIMIT)
+    items = get_next_by_category("Invasion", 15)
 
-        if not invasion_list:
-            await ctx.send("❌ Could not fetch Mu Firez invasion timers.")
-            return
-
-        embed = build_embed(
-            "⚔️ Mu Firez - Next Invasion Timers",
-            invasion_list,
-            "Times shown in UTC + live countdown from Mu Firez API"
-        )
-
-        await ctx.send(embed=embed)
-
-    except Exception as ex:
-        await ctx.send(f"❌ Error fetching invasion timers: `{ex}`")
-
-@bot.command()
-async def all(ctx):
-    try:
-        events_list = get_items_by_category("Events", limit=5)
-        boss_list = get_items_by_category("Boss", limit=5)
-        invasion_list = get_items_by_category("Invasion", limit=5)
-
-        embed = discord.Embed(
-            title="🔥 Mu Firez - All Timers Overview",
-            color=discord.Color.red()
-        )
-
-        if events_list:
-            event_lines = []
-            for e in events_list:
-                dt = parse_next_occurrence(e["nextOccurrence"])
-                event_lines.append(f"• **{e['name']}** → `{format_countdown(dt)}`")
-            embed.add_field(name="📅 Events", value="\n".join(event_lines), inline=False)
-        else:
-            embed.add_field(name="📅 Events", value="No data", inline=False)
-
-        if boss_list:
-            boss_lines = []
-            for e in boss_list:
-                dt = parse_next_occurrence(e["nextOccurrence"])
-                boss_lines.append(f"• **{e['name']}** → `{format_countdown(dt)}`")
-            embed.add_field(name="👑 Boss", value="\n".join(boss_lines), inline=False)
-        else:
-            embed.add_field(name="👑 Boss", value="No data", inline=False)
-
-        if invasion_list:
-            invasion_lines = []
-            for e in invasion_list:
-                dt = parse_next_occurrence(e["nextOccurrence"])
-                invasion_lines.append(f"• **{e['name']}** → `{format_countdown(dt)}`")
-            embed.add_field(name="⚔️ Invasion", value="\n".join(invasion_lines), inline=False)
-        else:
-            embed.add_field(name="⚔️ Invasion", value="No data", inline=False)
-
-        embed.set_footer(text="Live countdown from Mu Firez API")
-
-        await ctx.send(embed=embed)
-
-    except Exception as ex:
-        await ctx.send(f"❌ Error fetching all timers: `{ex}`")
-
-@bot.command()
-async def setalerts(ctx):
-    settings["alert_channel_id"] = ctx.channel.id
-    save_settings()
-    await ctx.send(f"✅ Auto reminder channel set to {ctx.channel.mention}")
-
-@bot.command()
-async def status(ctx):
-    enabled = settings.get("alerts_enabled", False)
-    channel_id = settings.get("alert_channel_id")
-
-    if channel_id:
-        channel_text = f"<#{channel_id}>"
-    else:
-        channel_text = "Not set"
-
-    embed = discord.Embed(
-        title="🔔 Auto Reminder Status",
-        color=discord.Color.green() if enabled else discord.Color.orange()
-    )
-    embed.add_field(name="Alerts Enabled", value=str(enabled), inline=False)
-    embed.add_field(name="Alert Channel", value=channel_text, inline=False)
-    embed.add_field(name="Alert Time", value=f"{ALERT_MINUTES_BEFORE} minutes before spawn", inline=False)
-    embed.set_footer(text="Use !setalerts, !alerts on, !alerts off")
-
-    await ctx.send(embed=embed)
-
-@bot.command()
-async def alerts(ctx, mode=None):
-    if mode is None:
-        await ctx.send("Usage: `!alerts on` or `!alerts off`")
+    if not items:
+        await ctx.send("No upcoming Invasion timers found.")
         return
 
-    mode = mode.lower()
+    lines = ["⚔️ **Mu Firez - Next Invasion Timers**\n"]
+    for event in items:
+        dt = parse_event_time(event)
+        name = get_event_name(event)
+        lines.append(f"• {name} ➜ {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
-    if mode == "on":
-        if not settings.get("alert_channel_id"):
-            await ctx.send("❌ Set an alert channel first with `!setalerts`")
-            return
+    lines.append("\nTimes shown are from Mu Firez API (UTC)")
+    await ctx.send("\n".join(lines))
 
-        settings["alerts_enabled"] = True
-        save_settings()
-        await ctx.send("✅ Auto reminders are now **ON**")
+# =========================
+# AUTO REMINDER LOOP
+# =========================
+@tasks.loop(minutes=1)
+async def auto_reminder_loop():
+    channel_id = settings.get("discord_channel_id", 0)
+    farmers_role_id = settings.get("farmers_role_id", 0)
+    notify_minutes = settings.get("notify_minutes_before", 5)
+    enabled_categories = settings.get("enabled_categories", {})
 
-    elif mode == "off":
-        settings["alerts_enabled"] = False
-        save_settings()
-        await ctx.send("🛑 Auto reminders are now **OFF**")
+    if not channel_id:
+        print("No discord_channel_id set in bot_settings.json")
+        return
 
-    else:
-        await ctx.send("Usage: `!alerts on` or `!alerts off`")
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        print("Could not find channel. Check discord_channel_id.")
+        return
+
+    data = fetch_mufirez_events()
+    now = datetime.now(timezone.utc)
+
+    for event in data:
+        name = get_event_name(event)
+        category = get_event_category(event)
+        dt = parse_event_time(event)
+
+        if not dt:
+            continue
+
+        # Skip disabled categories
+        if not enabled_categories.get(category, False):
+            continue
+
+        # Ensure timezone aware
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        diff_seconds = (dt - now).total_seconds()
+        diff_minutes = diff_seconds / 60
+
+        # Trigger only if event is within the reminder window
+        # (example: between 4.0 and 5.0 minutes before if notify_minutes = 5)
+        if notify_minutes - 1 < diff_minutes <= notify_minutes:
+            reminder_key = f"{category}|{name}|{dt.isoformat()}|{notify_minutes}"
+
+            if reminder_key in sent_reminders:
+                continue
+
+            sent_reminders.add(reminder_key)
+
+            role_mention = f"<@&{farmers_role_id}>" if farmers_role_id else "@farmers"
+
+            message = (
+                f"{role_mention}\n"
+                f"⏰ **Mu Firez Reminder**\n"
+                f"**{name}** ({category}) starts in **{notify_minutes} minutes!**\n"
+                f"🕒 Spawn Time: **{dt.strftime('%Y-%m-%d %H:%M:%S UTC')}**"
+            )
+
+            try:
+                await channel.send(message)
+                print(f"Reminder sent: {name} ({category})")
+            except Exception as e:
+                print(f"Failed to send reminder: {e}")
+
+    # Clean old reminder keys occasionally
+    cleanup_old_reminders()
+
+def cleanup_old_reminders():
+    # Removes reminders for events that already passed a while ago
+    # Keeps memory from growing too much during long uptime
+    to_remove = []
+    now = datetime.now(timezone.utc)
+
+    for key in sent_reminders:
+        try:
+            parts = key.split("|")
+            dt = datetime.fromisoformat(parts[2])
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+
+            # Remove if older than 2 hours
+            if now - dt > timedelta(hours=2):
+                to_remove.append(key)
+        except:
+            to_remove.append(key)
+
+    for key in to_remove:
+        sent_reminders.discard(key)
+
+@auto_reminder_loop.before_loop
+async def before_auto_reminder_loop():
+    await bot.wait_until_ready()
+    print("Auto reminder loop started.")
+
+# =========================
+# BOT READY
+# =========================
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+    print("Mu Firez Timer Bot is online!")
+
+    if not auto_reminder_loop.is_running():
+        auto_reminder_loop.start()
 
 # =========================
 # START BOT
 # =========================
+TOKEN = os.getenv("DISCORD_TOKEN")
+
 if not TOKEN:
     raise ValueError("DISCORD_TOKEN environment variable is not set.")
 
