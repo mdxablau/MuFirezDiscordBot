@@ -1,6 +1,5 @@
 {
     "timezone": "UTC",
-    "notify_minutes_before": 5,
     "discord_channel_id": 1493841667231449210,
     "farmers_role_id": 1493850248488161321,
     "enabled_categories": {
