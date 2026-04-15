@@ -1,9 +1,11 @@
 {
-    "alerts_enabled": true,
-    "alert_channel_id": 1493841667231449210,
-    "sent_alerts": [
-        "Events|Blood Castle|2026-04-15T05:30:00.000Z",
-        "Events|Double Goer|2026-04-15T05:30:00.000Z",
-        "Invasion|Balrog|2026-04-15T05:30:00.000Z"
-    ]
+    "timezone": "UTC",
+    "notify_minutes_before": 5,
+    "discord_channel_id": 1493841667231449210,
+    "farmers_role_id": 1493850248488161321,
+    "enabled_categories": {
+        "Events": true,
+        "Boss": true,
+        "Invasion": true
+    }
 }
