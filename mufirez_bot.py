@@ -1,5 +1,4 @@
 import os
-import asyncio
 import discord
 from discord.ext import commands, tasks
 from datetime import datetime, timedelta, timezone
@@ -14,7 +13,7 @@ DISCORD_CHANNEL_ID = 1493841667231449210
 FARMERS_ROLE_ID = 1493850248488161321
 
 # Reminder times (minutes before invasion)
-REMINDER_MINUTES = [5, 1]
+REMINDER_MINUTES = [1]
 
 # Duplicate protection
 sent_reminders = set()
@@ -158,12 +157,12 @@ async def auto_invasion_reminder_loop():
 
             diff_seconds = (spawn_dt - now).total_seconds()
 
-            # Check 5 min and 1 min reminders
+            # Check only 1-minute reminder
             for minutes_before in REMINDER_MINUTES:
                 target_seconds = minutes_before * 60
 
-                # 1-second loop, use 1-second safe window
-                if target_seconds - 1 < diff_seconds <= target_seconds:
+                # 2-second safe window (better for Railway)
+                if target_seconds - 2 < diff_seconds <= target_seconds:
                     reminder_key = f"{invasion_name}|{spawn_dt.isoformat()}|{minutes_before}"
 
                     if reminder_key not in sent_reminders:
@@ -174,13 +173,13 @@ async def auto_invasion_reminder_loop():
                         message = (
                             f"{role_mention}\n"
                             f"⚔️ **Mu Firez Invasion Reminder**\n"
-                            f"**{invasion_name}** starts in **{minutes_before} minute{'s' if minutes_before != 1 else ''}!**\n"
+                            f"**{invasion_name}** starts in **1 minute!**\n"
                             f"🕒 Spawn Time: **{spawn_dt.strftime('%H:%M:%S GMT-3')}**"
                         )
 
                         try:
                             await channel.send(message)
-                            print(f"Reminder sent: {invasion_name} - {minutes_before} min")
+                            print(f"Reminder sent: {invasion_name} - 1 min")
                         except Exception as e:
                             print(f"Failed to send reminder: {e}")
 
@@ -215,6 +214,7 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
     print("Mu Firez Invasion Bot is online!")
     print("Using manual invasion schedule (GMT-3)")
+    print("Reminder mode: 1 minute only")
 
     if not auto_invasion_reminder_loop.is_running():
         auto_invasion_reminder_loop.start()
