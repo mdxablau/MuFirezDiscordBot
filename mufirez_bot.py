@@ -1,6 +1,5 @@
 import os
-import json
-import requests
+import asyncio
 import discord
 from discord.ext import commands, tasks
 from datetime import datetime, timedelta, timezone
@@ -8,40 +7,44 @@ from datetime import datetime, timedelta, timezone
 # =========================
 # CONFIG
 # =========================
-API_URL = "https://api.mufirez.net/api/events"
-SETTINGS_FILE = "bot_settings.json"
+# Invasion schedule times are based on GMT-3 (Brazil time)
+INVASION_TZ = timezone(timedelta(hours=-3))
 
-# In-memory cache + duplicate protection
-cached_events = []
+DISCORD_CHANNEL_ID = 1493841667231449210
+FARMERS_ROLE_ID = 1493850248488161321
+
+# Reminder times (minutes before invasion)
+REMINDER_MINUTES = [5, 1]
+
+# Duplicate protection
 sent_reminders = set()
 
-# Reminder schedule (minutes before event)
-REMINDER_MINUTES = [5, 3, 1]
-
 # =========================
-# LOAD SETTINGS
+# MANUAL INVASION SCHEDULE
 # =========================
-def load_settings():
-    default_settings = {
-        "timezone": "UTC",
-        "discord_channel_id": 1493841667231449210,
-        "farmers_role_id": 1493850248488161321,
-        "enabled_categories": {
-            "Events": True,
-            "Boss": True,
-            "Invasion": True
-        }
-    }
-
-    if not os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(default_settings, f, indent=4)
-        return default_settings
-
-    with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-settings = load_settings()
+INVASION_SCHEDULE = {
+    "Golden": ["02:15", "06:15", "10:15", "14:15", "18:15", "22:15"],
+    "Skeleton King": ["03:15", "07:15", "11:15", "15:15", "19:15", "23:15"],
+    "Red Dragon": ["01:30", "05:30", "09:30", "13:30", "17:30", "21:30"],
+    "Ice Queen": ["00:30", "04:30", "08:30", "12:30", "16:30", "20:30"],
+    "Balrog": ["02:30", "06:30", "10:30", "14:30", "18:30", "22:30"],
+    "Hydra": ["01:15", "05:15", "09:15", "13:15", "17:15", "21:15"],
+    "Zaikan": ["00:15", "04:15", "08:15", "12:15", "16:15", "20:15"],
+    "Gorgon": ["03:30", "07:30", "11:30", "15:30", "19:30", "23:30"],
+    "Tiger": ["00:00", "06:00", "12:00", "18:00"],
+    "Sheep": ["01:00", "07:00", "13:00", "19:00"],
+    "Rat": ["02:00", "08:00", "14:00", "20:00"],
+    "Buffalo": ["04:00", "10:00", "16:00", "22:00"],
+    "Rabbit": ["05:00", "11:00", "17:00", "23:00"],
+    "Chiken": [
+        "00:40", "01:40", "02:40", "03:40", "04:40", "05:40",
+        "06:40", "07:40", "08:40", "09:40", "10:40", "11:40",
+        "12:40", "13:40", "14:40", "15:40", "16:40", "17:40",
+        "18:40", "19:40", "20:40", "21:40", "22:40", "23:40"
+    ],
+    "Dark Evolution": ["00:20", "09:20", "14:20", "22:20"],
+    "Elite": ["00:05", "04:05", "08:05", "12:05", "16:05", "20:05"]
+}
 
 # =========================
 # DISCORD SETUP
@@ -51,107 +54,59 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
-# API FETCH
+# TIME HELPERS
 # =========================
-def fetch_mufirez_events():
-    try:
-        response = requests.get(API_URL, timeout=15)
-        response.raise_for_status()
+def get_now_gmt3():
+    return datetime.now(INVASION_TZ)
 
-        outer = response.json()
-        data = outer.get("data", [])
+def parse_time_today(time_str):
+    now = get_now_gmt3()
+    hour, minute = map(int, time_str.split(":"))
+    return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
-        if isinstance(data, dict):
-            combined = []
+def get_next_spawn_for_invasion(name):
+    now = get_now_gmt3()
+    times = INVASION_SCHEDULE.get(name, [])
 
-            if "events" in data and isinstance(data["events"], list):
-                for item in data["events"]:
-                    item["category"] = "Events"
-                    combined.append(item)
+    candidates = []
 
-            if "boss" in data and isinstance(data["boss"], list):
-                for item in data["boss"]:
-                    item["category"] = "Boss"
-                    combined.append(item)
+    for t in times:
+        spawn_today = parse_time_today(t)
 
-            if "invasion" in data and isinstance(data["invasion"], list):
-                for item in data["invasion"]:
-                    item["category"] = "Invasion"
-                    combined.append(item)
+        if spawn_today > now:
+            candidates.append(spawn_today)
+        else:
+            candidates.append(spawn_today + timedelta(days=1))
 
-            return combined
+    if not candidates:
+        return None
 
-        elif isinstance(data, list):
-            return data
+    return min(candidates)
 
-        return []
+def get_all_next_invasions():
+    results = []
 
-    except Exception as e:
-        print(f"Error fetching Mu Firez API: {e}")
-        return []
+    for name in INVASION_SCHEDULE.keys():
+        next_spawn = get_next_spawn_for_invasion(name)
+        if next_spawn:
+            results.append((name, next_spawn))
 
-# =========================
-# DATETIME PARSER
-# =========================
-def parse_event_time(event):
-    possible_keys = [
-        "startAt",
-        "start_at",
-        "date",
-        "datetime",
-        "time",
-        "nextSpawn",
-        "next_spawn",
-        "nextOccurrence"
-    ]
+    results.sort(key=lambda x: x[1])
+    return results
 
-    for key in possible_keys:
-        if key in event and event[key]:
-            raw = str(event[key]).strip()
+def format_remaining(target_dt):
+    now = get_now_gmt3()
+    diff = target_dt - now
 
-            if raw.endswith("Z"):
-                raw = raw.replace("Z", "+00:00")
+    total_seconds = int(diff.total_seconds())
+    if total_seconds < 0:
+        total_seconds = 0
 
-            try:
-                return datetime.fromisoformat(raw)
-            except:
-                pass
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
 
-    return None
-
-# =========================
-# EVENT HELPERS
-# =========================
-def get_event_name(event):
-    return (
-        event.get("name")
-        or event.get("title")
-        or event.get("event")
-        or event.get("boss")
-        or event.get("monster")
-        or "Unknown"
-    )
-
-def get_event_category(event):
-    category = event.get("category", "Unknown")
-
-    if category == "Unknown":
-        category = event.get("type") or event.get("category") or "Unknown"
-
-    return str(category)
-
-def get_next_by_category(category_name, limit=10):
-    filtered = []
-
-    for event in cached_events:
-        category = get_event_category(event).lower()
-        if category == category_name.lower():
-            dt = parse_event_time(event)
-            if dt:
-                filtered.append((dt, event))
-
-    filtered.sort(key=lambda x: x[0])
-    return [event for _, event in filtered[:limit]]
+    return f"{hours:02}:{minutes:02}:{seconds:02}"
 
 # =========================
 # COMMANDS
@@ -161,156 +116,90 @@ async def ping(ctx):
     await ctx.send("🏓 Pong!")
 
 @bot.command()
-async def events(ctx):
-    items = get_next_by_category("Events", 10)
-
-    if not items:
-        await ctx.send("No upcoming Events found.")
-        return
-
-    lines = ["🔥 **Mu Firez - Next Event Timers**\n"]
-    for event in items:
-        dt = parse_event_time(event)
-        name = get_event_name(event)
-        lines.append(f"• {name} ➜ {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-
-    lines.append("\nTimes shown are from Mu Firez API cache (UTC)")
-    await ctx.send("\n".join(lines))
-
-@bot.command()
-async def boss(ctx):
-    items = get_next_by_category("Boss", 10)
-
-    if not items:
-        await ctx.send("No upcoming Boss timers found.")
-        return
-
-    lines = ["👑 **Mu Firez - Next Boss Timers**\n"]
-    for event in items:
-        dt = parse_event_time(event)
-        name = get_event_name(event)
-        lines.append(f"• {name} ➜ {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-
-    lines.append("\nTimes shown are from Mu Firez API cache (UTC)")
-    await ctx.send("\n".join(lines))
-
-@bot.command()
 async def invasion(ctx):
-    items = get_next_by_category("Invasion", 15)
+    next_invasions = get_all_next_invasions()[:10]
 
-    if not items:
-        await ctx.send("No upcoming Invasion timers found.")
+    if not next_invasions:
+        await ctx.send("No invasion timers found.")
         return
 
-    lines = ["⚔️ **Mu Firez - Next Invasion Timers**\n"]
-    for event in items:
-        dt = parse_event_time(event)
-        name = get_event_name(event)
-        lines.append(f"• {name} ➜ {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    lines = ["⚔️ **Mu Firez - Next Invasion Timers (GMT-3)**\n"]
 
-    lines.append("\nTimes shown are from Mu Firez API cache (UTC)")
+    for name, spawn_time in next_invasions:
+        remaining = format_remaining(spawn_time)
+        lines.append(
+            f"• **{name}** ➜ {spawn_time.strftime('%H:%M:%S')} "
+            f"(**in {remaining}**)"
+        )
+
+    lines.append("\nTimes shown are based on your custom invasion schedule (GMT-3)")
     await ctx.send("\n".join(lines))
 
 # =========================
-# FETCH LOOP (LOW API SPAM)
-# =========================
-@tasks.loop(seconds=30)
-async def refresh_event_cache():
-    global cached_events
-
-    data = fetch_mufirez_events()
-    if data:
-        cached_events = data
-        print(f"Cache refreshed: {len(cached_events)} events loaded")
-    else:
-        print("Cache refresh returned no data (keeping old cache if available)")
-
-@refresh_event_cache.before_loop
-async def before_refresh_event_cache():
-    await bot.wait_until_ready()
-
-# =========================
-# REMINDER LOOP (USES CACHE)
+# AUTO REMINDER LOOP
 # =========================
 @tasks.loop(seconds=1)
-async def auto_reminder_loop():
-    channel_id = settings.get("discord_channel_id", 0)
-    farmers_role_id = settings.get("farmers_role_id", 0)
-    enabled_categories = settings.get("enabled_categories", {})
+async def auto_invasion_reminder_loop():
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
 
-    if not channel_id:
-        print("No discord_channel_id set in bot_settings.json")
-        return
-
-    channel = bot.get_channel(channel_id)
     if not channel:
-        print("Could not find channel. Check discord_channel_id.")
+        print("Could not find channel. Check DISCORD_CHANNEL_ID.")
         return
 
-    now = datetime.now(timezone.utc)
+    now = get_now_gmt3()
 
-    for event in cached_events:
-        name = get_event_name(event)
-        category = get_event_category(event)
-        dt = parse_event_time(event)
+    for invasion_name, times in INVASION_SCHEDULE.items():
+        for time_str in times:
+            spawn_dt = parse_time_today(time_str)
 
-        if not dt:
-            continue
+            # If today's time already passed, skip it
+            if spawn_dt <= now:
+                continue
 
-        if not enabled_categories.get(category, False):
-            continue
+            diff_seconds = (spawn_dt - now).total_seconds()
 
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            # Check 5 min and 1 min reminders
+            for minutes_before in REMINDER_MINUTES:
+                target_seconds = minutes_before * 60
 
-        diff_seconds = (dt - now).total_seconds()
+                # 1-second loop, use 1-second safe window
+                if target_seconds - 1 < diff_seconds <= target_seconds:
+                    reminder_key = f"{invasion_name}|{spawn_dt.isoformat()}|{minutes_before}"
 
-        # Skip already passed events
-        if diff_seconds <= 0:
-            continue
+                    if reminder_key not in sent_reminders:
+                        sent_reminders.add(reminder_key)
 
-        # Check each reminder time (5, 3, 1 minutes)
-        for minutes_before in REMINDER_MINUTES:
-            target_seconds = minutes_before * 60
+                        role_mention = f"<@&{FARMERS_ROLE_ID}>"
 
-            # 30-second safe window to avoid missing reminder due to cache timing
-            if target_seconds - 30 < diff_seconds <= target_seconds:
-                reminder_key = f"{category}|{name}|{dt.isoformat()}|{minutes_before}"
+                        message = (
+                            f"{role_mention}\n"
+                            f"⚔️ **Mu Firez Invasion Reminder**\n"
+                            f"**{invasion_name}** starts in **{minutes_before} minute{'s' if minutes_before != 1 else ''}!**\n"
+                            f"🕒 Spawn Time: **{spawn_dt.strftime('%H:%M:%S GMT-3')}**"
+                        )
 
-                if reminder_key not in sent_reminders:
-                    sent_reminders.add(reminder_key)
-
-                    role_mention = f"<@&{farmers_role_id}>" if farmers_role_id else "@Farmers"
-
-                    message = (
-                        f"{role_mention}\n"
-                        f"⏰ **Mu Firez Reminder**\n"
-                        f"**{name}** ({category}) starts in **{minutes_before} minute{'s' if minutes_before != 1 else ''}!**\n"
-                        f"🕒 Spawn Time: **{dt.strftime('%Y-%m-%d %H:%M:%S UTC')}**"
-                    )
-
-                    try:
-                        await channel.send(message)
-                        print(f"Reminder sent: {name} ({category}) - {minutes_before} min")
-                    except Exception as e:
-                        print(f"Failed to send reminder: {e}")
+                        try:
+                            await channel.send(message)
+                            print(f"Reminder sent: {invasion_name} - {minutes_before} min")
+                        except Exception as e:
+                            print(f"Failed to send reminder: {e}")
 
     cleanup_old_reminders()
 
 def cleanup_old_reminders():
-    now = datetime.now(timezone.utc)
-
+    now = get_now_gmt3()
     to_remove = []
+
     for key in sent_reminders:
         try:
             parts = key.split("|")
-            dt = datetime.fromisoformat(parts[2])
+            spawn_dt = datetime.fromisoformat(parts[1])
 
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
+            if spawn_dt.tzinfo is None:
+                spawn_dt = spawn_dt.replace(tzinfo=INVASION_TZ)
 
-            # Remove old reminder records 2 hours after event
-            if now - dt > timedelta(hours=2):
+            # Remove reminder records 2 hours after spawn
+            if now - spawn_dt > timedelta(hours=2):
                 to_remove.append(key)
         except:
             to_remove.append(key)
@@ -324,24 +213,11 @@ def cleanup_old_reminders():
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
-    print("Mu Firez Timer Bot is online!")
+    print("Mu Firez Invasion Bot is online!")
+    print("Using manual invasion schedule (GMT-3)")
 
-    if not refresh_event_cache.is_running():
-        refresh_event_cache.start()
-
-    if not auto_reminder_loop.is_running():
-        auto_reminder_loop.start()
-
-    # Prime cache immediately on startup
-    global cached_events
-    initial_data = fetch_mufirez_events()
-    if initial_data:
-        cached_events = initial_data
-        print(f"Initial cache loaded: {len(cached_events)} events")
-    else:
-        print("Initial cache load failed")
-
-    print("Auto reminder loop started.")
+    if not auto_invasion_reminder_loop.is_running():
+        auto_invasion_reminder_loop.start()
 
 # =========================
 # START BOT
