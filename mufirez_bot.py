@@ -31,6 +31,7 @@ INVASION_SCHEDULE = {
     "Zaikan": ["00:15", "04:15", "08:15", "12:15", "16:15", "20:15"],
     "Gorgon": ["03:30", "07:30", "11:30", "15:30", "19:30", "23:30"],
     "Tiger": ["00:00", "06:00", "12:00", "18:00"],
+    "Pig": ["03:00", "09:00", "15:00", "21:00"],
     "Sheep": ["01:00", "07:00", "13:00", "19:00"],
     "Rat": ["02:00", "08:00", "14:00", "20:00"],
     "Buffalo": ["04:00", "10:00", "16:00", "22:00"],
@@ -116,7 +117,7 @@ async def ping(ctx):
 
 @bot.command()
 async def invasion(ctx):
-    next_invasions = get_all_next_invasions()[:10]
+    next_invasions = get_all_next_invasions()[:12]
 
     if not next_invasions:
         await ctx.send("No invasion timers found.")
