@@ -47,6 +47,29 @@ INVASION_SCHEDULE = {
 }
 
 # =========================
+# INVASION MAPS
+# =========================
+INVASION_MAPS = {
+    "Golden": "Unknown",
+    "Skeleton King": "Unknown",
+    "Red Dragon": "Unknown",
+    "Ice Queen": "Devias",
+    "Balrog": "Losttower",
+    "Hydra": "Atlans",
+    "Zaikan": "Tarkan",
+    "Gorgon": "Dungeon",
+    "Tiger": "Lorencia",
+    "Pig": "Noria",
+    "Sheep": "Lorencia",
+    "Rat": "Noria",
+    "Buffalo": "Elbeland",
+    "Rabbit": "Elbeland",
+    "Chiken": "Unknown",
+    "Dark Evolution": "Unknown",
+    "Elite": "Unknown"
+}
+
+# =========================
 # DISCORD SETUP
 # =========================
 intents = discord.Intents.default()
@@ -127,9 +150,11 @@ async def invasion(ctx):
 
     for name, spawn_time in next_invasions:
         remaining = format_remaining(spawn_time)
+        invasion_map = INVASION_MAPS.get(name, "Unknown")
+
         lines.append(
             f"• **{name}** ➜ {spawn_time.strftime('%H:%M:%S')} "
-            f"(**in {remaining}**)"
+            f"(**in {remaining}**) | 📍 **{invasion_map}**"
         )
 
     lines.append("\nTimes shown are based on your custom invasion schedule (GMT-3)")
@@ -149,6 +174,8 @@ async def auto_invasion_reminder_loop():
     now = get_now_gmt3()
 
     for invasion_name, times in INVASION_SCHEDULE.items():
+        invasion_map = INVASION_MAPS.get(invasion_name, "Unknown")
+
         for time_str in times:
             spawn_dt = parse_time_today(time_str)
 
@@ -175,6 +202,7 @@ async def auto_invasion_reminder_loop():
                             f"{role_mention}\n"
                             f"⚔️ **Mu Firez Invasion Reminder**\n"
                             f"**{invasion_name}** starts in **1 minute!**\n"
+                            f"📍 Map: **{invasion_map}**\n"
                             f"🕒 Spawn Time: **{spawn_dt.strftime('%H:%M:%S GMT-3')}**"
                         )
 
@@ -216,6 +244,7 @@ async def on_ready():
     print("Mu Firez Invasion Bot is online!")
     print("Using manual invasion schedule (GMT-3)")
     print("Reminder mode: 1 minute only")
+    print("Map display enabled")
 
     if not auto_invasion_reminder_loop.is_running():
         auto_invasion_reminder_loop.start()
